@@ -39,17 +39,17 @@ class conv2d:
         return out
 
 class Layer_norm():
-    def __init__(self, name, axes):
-        self.name = name 
+    def __init__(self, name, shape, axes):
+        self.name = name
+        self.shape = shape
         self.axes = axes
         self.vars = {}
 
-    def __call__(self, x):
-        shape = tf.shape(x)
         with tf.compat.v1.variable_scope(self.name + '_vars'):
-            self.vars['gamma'] = tf.get_variable('gamma', initializer=tf.ones(shape))
-            self.vars['beta']  = tf.get_variable('beta', initializer=tf.zeros(shape))
+            self.vars['gamma'] = tf.get_variable('gamma', initializer=tf.ones(self.shape))
+            self.vars['beta']  = tf.get_variable('beta', initializer=tf.zeros(self.shape))
 
+    def __call__(self, x):
         mu, sigma = tf.nn.moments(x, axes=self.axes, keep_dims=True)
         _x = (x - mu) / tf.sqrt(sigma + 1e-5) * self.vars['gamma'] + self.vars['beta']
         return _x
@@ -78,7 +78,7 @@ class gcn:
                 out.append(x2)
                 x1 = x2
 
-        h = tf.concatenate(out, axis=1)
+        h = tf.concatenate(out, axis=3)
         h = self.mlp(h)
         h = tf.nn.dropout(h, self.dropout)
         return h
@@ -86,13 +86,17 @@ class gcn:
 class gwnet:
     def __init__(self, name, num_nodes, dropout=0.3, support_len=None, gcn_bool=True, addaptadj=True, aptinit=None, in_dim=2,
                  out_dim=12, residual_channels=32, dilation_channels=32, skip_channels=256, end_channels=512, kernel_size=2,
-                 blocks=4, layers=2):
+                 blocks=4, layers=2, num_slots=12, batch_size=64):
         self.name = name
         self.dropout = dropout
         self.blocks = blocks
         self.layers = layers
         self.gcn_bool = gcn_bool
         self.addaptadj = addaptadj
+        self.num_slots = num_slots
+        self.num_nodes = num_nodes
+        self.in_dim = in_dim
+        self.out_dim = out_dim
 
         self.filter_convs = []
         self.gate_convs = []
@@ -121,6 +125,7 @@ class gwnet:
                 print ('aptinit must be None')
                 exit()
 
+        count = 1
         for b in range(blocks):
             additional_scope = kernel_size - 1
             new_dilation = 1
@@ -142,16 +147,80 @@ class gwnet:
                                               dilation=1))
 
                 self.bn.append(Layer_norm(name=f'batch_norm_{b}_{i}',
-                                          axes=[3]))
+                                          shape=[batch_size, num_slots-count, num_nodes, 1],
+                                          axes=[0,1,2]))
+                count += 1
 
+                new_dilation *= 2
+                receptive_field += additional_scope
+                additional_scope *= 2
+                if self.gcn_bool:
+                    self.gconv.append(gcn(dilation_channels, residual_channels, dropout, support_len=self.support_len))
 
+        self.end_conv_1 = conv2d(name='end_conv_1',
+                                 shape=[1,1,skip_channels,end_channels], 
+                                 dilation=1)
 
+        self.end_conv_2 = conv2d(name='end_conv_2',
+                                 shape=[1,1,end_channels, out_dim],
+                                 dilation=1)
 
-
+        self.receptive_field = receptive_field
+        self.computation_graph()
 
     def computation_graph(self):
-        self.x = tf.placeholder(dtype=tf.float32, shape=[None, self.n_slots, self.n_nodes, self.din]) 
-        self.layers = []
+        self.x = tf.placeholder(dtype=tf.float32, shape=[None, self.num_slots, self.num_nodes, self.in_dim])
+        self.y = tf.placeholder(dtype=tf.float32, shape=[None, self.out_dim, self.num_nodes, 1])
+
+        in_len = self.num_slots
+        if in_len < self.receptive_field:
+            padding = tf.constant([[0,0],[self.receptive_field - in_len, 0],[0,0],[0,0]])
+            x = tf.pad(self.x, padding)
+        else:
+            x = self.x
+
+        x = self.start_conv(x)
+        skip = 0
+
+        new_supports = None
+
+        if self.gcn_bool and self.addaptadj and self.supports is not None:
+            adp = tf.nn.softmax(tf.nn.relu(tf.matmul(self.nodevec1,self.nodevec2)),axis=1)
+            new_supports = self.supports + [adp]
+
+        for i in range(self.blocks * self.layers):
+            residual = x
+            _filter = self.filter_convs[i](residual)
+            _filter = tf.nn.tanh(_filter)
+            gate = self.gate_convs[i](residual)
+            gate = tf.nn.sigmoid(gate)
+            x = tf.multiply(_filter, gate)
+
+            s = x
+            s = self.skip_convs[i](s)
+            try:
+                skip = skip[:,-tf.shape(s)[1]:,:,:]
+            except:
+                skip = 0
+            skip = s + skip
+
+            if self.gcn_bool and self.supports is not None:
+                if self.addaptadj:
+                    x = self.gconv[i](x, new_supports)
+                else:
+                    x = self.gconv[i](x, self.supports)
+            else:
+                x = self.residual_convs[i](x)
+
+            x = x + residual[:,-tf.shape(x)[1]:,:,:]
+            x = self.bn[i](x)
+
+        x = tf.nn.relu(skip)
+        x = tf.nn.relu(self.end_conv_1(x))
+        x = self.end_conv_2(x)
+        return x
+
+
 
 
 
