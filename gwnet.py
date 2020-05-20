@@ -1,5 +1,12 @@
 import tensorflow as tf
 
+def init_weight(name, shape):
+    initializer = tf.contrib.layers.variance_scaling_initializer()
+    return tf.compat.v1.get_variable(name=name, shape=shape, dtype=tf.float32, initializer=initializer)
+
+def init_bias(name, shape):
+    return tf.compat.v1.get_variable(name = name, shape=shape, initializer=tf.constant_initializer(0.0))
+
 class nconv:
     def __init__(self, name):
         self.name = name
@@ -35,7 +42,7 @@ class conv2d:
             self.vars['bias'] = init_bias(name='bias', shape=shape[-1])
 
     def __call__(self, x):
-        out = tf.nn.conv2d(x, self.vars['weight'], strides=[1,1,1,1], padding='VALID', dilation=self.dilation) + self.vars['bias']
+        out = tf.nn.conv2d(x, self.vars['weight'], strides=[1,1,1,1], padding='VALID', dilations=self.dilation) + self.vars['bias']
         return out
 
 class Layer_norm():
@@ -84,7 +91,7 @@ class gcn:
         return h
 
 class gwnet:
-    def __init__(self, name, num_nodes, dropout=0.3, support_len=None, gcn_bool=True, addaptadj=True, aptinit=None, in_dim=2,
+    def __init__(self, name, num_nodes, supports, dropout=0.3, support_len=None, gcn_bool=True, addaptadj=True, aptinit=None, in_dim=2,
                  out_dim=12, residual_channels=32, dilation_channels=32, skip_channels=256, end_channels=512, kernel_size=2,
                  blocks=4, layers=2, num_slots=12, batch_size=64):
         self.name = name
@@ -119,7 +126,7 @@ class gwnet:
                     self.supports = []
 
                 self.nodevec1 = init_weight(name='E1', shape=[num_nodes, 10])
-                self.nodevec1 = init_weight(name='E2', shape=[10, num_nodes])
+                self.nodevec2 = init_weight(name='E2', shape=[10, num_nodes])
                 self.supports_len += 1
             else:
                 print ('aptinit must be None')
@@ -155,7 +162,12 @@ class gwnet:
                 receptive_field += additional_scope
                 additional_scope *= 2
                 if self.gcn_bool:
-                    self.gconv.append(gcn(dilation_channels, residual_channels, dropout, support_len=self.support_len))
+                    self.gconv.append(gcn(name=f'gcn_{b}_{i}',
+                                          c_in=dilation_channels, 
+                                          c_out=residual_channels, 
+                                          dropout=self.dropout, 
+                                          support_len=self.supports_len, 
+                                          order=2))
 
         self.end_conv_1 = conv2d(name='end_conv_1',
                                  shape=[1,1,skip_channels,end_channels], 
@@ -166,7 +178,8 @@ class gwnet:
                                  dilation=1)
 
         self.receptive_field = receptive_field
-        self.computation_graph()
+        self._y = self.computation_graph()
+        self.initialize()
 
     def computation_graph(self):
         self.x = tf.placeholder(dtype=tf.float32, shape=[None, self.num_slots, self.num_nodes, self.in_dim])
@@ -185,7 +198,7 @@ class gwnet:
         new_supports = None
 
         if self.gcn_bool and self.addaptadj and self.supports is not None:
-            adp = tf.nn.softmax(tf.nn.relu(tf.matmul(self.nodevec1,self.nodevec2)),axis=1)
+            adp = tf.nn.softmax(tf.nn.relu(tf.matmul(self.nodevec1, self.nodevec2)),axis=1)
             new_supports = self.supports + [adp]
 
         for i in range(self.blocks * self.layers):
@@ -220,6 +233,13 @@ class gwnet:
         x = self.end_conv_2(x)
         return x
 
+    def initialize(self):
+        self.sess = tf.Session()
+        self.sess.run(tf.global_variables_initialize())
+
+    def predict(self, x):
+        _y = self.sess.run(self._y, feed_dict={self.x:x})
+        return _y
 
 
 
